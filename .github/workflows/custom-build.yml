@@ -1,0 +1,215 @@
+name: Build PhotoCraft v0.14.0 + Camera Raw + selected PRs
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_release_url:
+        description: "Official PhotoCraft base release URL"
+        required: true
+        default: "https://github.com/storytold/photocraft/releases/tag/v0.14.0"
+        type: string
+      camera_raw_release_url:
+        description: "Camera Raw preview release URL"
+        required: true
+        default: "https://github.com/ametadot/photocraft/releases/tag/camera-raw-r3-preview-20261022"
+        type: string
+      include_wanikhawar_prs:
+        description: "Include all currently open PRs by wanikhawar targeting storytold/photocraft"
+        required: true
+        default: true
+        type: boolean
+      extra_pr_urls:
+        description: "Additional storytold/photocraft PR URLs, one per line, applied in this order"
+        required: true
+        default: |
+          https://github.com/storytold/photocraft/pull/8170
+          https://github.com/storytold/photocraft/pull/8679
+          https://github.com/storytold/photocraft/pull/8623
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: photocraft-custom-build-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Validate input links
+        shell: pwsh
+        env:
+          BASE_URL: ${{ inputs.base_release_url }}
+          CAMERA_URL: ${{ inputs.camera_raw_release_url }}
+          EXTRA_PR_URLS: ${{ inputs.extra_pr_urls }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          function Parse-ReleaseTag([string]$Value, [string]$Owner, [string]$Repo) {
+            $uri = $null
+            if (-not [Uri]::TryCreate($Value.Trim(), [UriKind]::Absolute, [ref]$uri)) { throw "Invalid URL: $Value" }
+            if ($uri.Host -ne "github.com") { throw "Only github.com URLs are accepted: $Value" }
+            $p = $uri.AbsolutePath.Trim('/').Split('/')
+            if ($p.Length -lt 5 -or $p[0] -ne $Owner -or $p[1] -ne $Repo -or $p[2] -ne "releases" -or $p[3] -ne "tag") {
+              throw "Expected github.com/$Owner/$Repo/releases/tag/TAG"
+            }
+            return [Uri]::UnescapeDataString($p[4])
+          }
+          function Parse-PrNumber([string]$Value) {
+            $uri = $null
+            if (-not [Uri]::TryCreate($Value.Trim(), [UriKind]::Absolute, [ref]$uri)) { throw "Invalid PR URL: $Value" }
+            if ($uri.Host -ne "github.com") { throw "Only github.com PR URLs are accepted: $Value" }
+            $p = $uri.AbsolutePath.Trim('/').Split('/')
+            if ($p.Length -lt 4 -or $p[0] -ne "storytold" -or $p[1] -ne "photocraft" -or $p[2] -ne "pull" -or $p[3] -notmatch '^\d+$') {
+              throw "Expected github.com/storytold/photocraft/pull/NUMBER: $Value"
+            }
+            return $p[3]
+          }
+          $baseTag = Parse-ReleaseTag $env:BASE_URL "storytold" "photocraft"
+          $cameraTag = Parse-ReleaseTag $env:CAMERA_URL "ametadot" "photocraft"
+          $prLines = @($env:EXTRA_PR_URLS -split "\r?\n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+          if ($prLines.Count -gt 30) { throw "Enter at most 30 explicit PR links." }
+          $prNumbers = @()
+          foreach ($line in $prLines) { $prNumbers += (Parse-PrNumber $line) }
+          if (($prNumbers | Select-Object -Unique).Count -ne $prNumbers.Count) { throw "Duplicate PR numbers entered." }
+          "BASE_TAG=$baseTag" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "CAMERA_TAG=$cameraTag" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "EXTRA_PR_NUMBERS=$($prNumbers -join ',')" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "Base: $baseTag; Camera Raw: $cameraTag; explicit PRs: $($prNumbers -join ', ')"
+
+      - name: Check out base and apply Camera Raw commits
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          function Invoke-Git {
+            param([Parameter(ValueFromRemainingArguments = $true)][string[]]$GitArgs)
+            & git @GitArgs
+            if ($LASTEXITCODE -ne 0) { throw "Git failed: git $($GitArgs -join ' ')" }
+          }
+          git config --global user.name "PhotoCraft Custom Build"
+          git config --global user.email "actions@users.noreply.github.com"
+          Invoke-Git init photocraft-src
+          Set-Location photocraft-src
+          Invoke-Git remote add origin https://github.com/storytold/photocraft.git
+          Invoke-Git fetch --no-tags origin "refs/tags/$env:BASE_TAG:refs/tags/$env:BASE_TAG"
+          Invoke-Git checkout --detach "refs/tags/$env:BASE_TAG"
+          Invoke-Git fetch https://github.com/ametadot/photocraft.git "refs/tags/$env:CAMERA_TAG:refs/tags/$env:CAMERA_TAG"
+          $base = "refs/tags/$env:BASE_TAG"
+          $camera = "refs/tags/$env:CAMERA_TAG"
+          & git merge-base $base $camera
+          if ($LASTEXITCODE -ne 0) { throw "Official release and Camera Raw tag have no common Git ancestor; automatic integration is unsafe." }
+          $commits = @(& git log --format=%H --reverse --topo-order --no-merges --cherry-pick --right-only "$base...$camera")
+          if ($LASTEXITCODE -ne 0) { throw "Could not calculate Camera Raw commits." }
+          if ($commits.Count -eq 0) {
+            Write-Host "No unique Camera Raw commits found. Preview may already be represented in base or need manual integration."
+          } else {
+            Write-Host "Applying $($commits.Count) Camera Raw-specific commits."
+            foreach ($sha in $commits) {
+              & git cherry-pick --empty=drop $sha
+              if ($LASTEXITCODE -ne 0) {
+                & git cherry-pick --abort
+                throw "Camera Raw commit $sha conflicted. Cherry-pick aborted; build stopped."
+              }
+            }
+          }
+
+      - name: Discover open PRs by wanikhawar
+        if: ${{ inputs.include_wanikhawar_prs }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $headers = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" }
+          $query = [Uri]::EscapeDataString("repo:storytold/photocraft is:pr is:open author:wanikhawar")
+          $result = Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/search/issues?q=$query&per_page=100"
+          $numbers = @($result.items | Where-Object { $_.pull_request } | ForEach-Object { [string]$_.number } | Sort-Object -Unique)
+          if ($result.total_count -gt 100) { throw "More than 100 matching PRs; pagination is required." }
+          "WANIKHAWAR_PR_NUMBERS=$($numbers -join ',')" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "Open PRs by wanikhawar: $($numbers -join ', ')"
+          if ($numbers.Count -eq 0) { Write-Host "No matching open PRs found." }
+
+      - name: Apply requested PR commits in order
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          function Invoke-Git {
+            param([Parameter(ValueFromRemainingArguments = $true)][string[]]$GitArgs)
+            & git @GitArgs
+            if ($LASTEXITCODE -ne 0) { throw "Git failed: git $($GitArgs -join ' ')" }
+          }
+          $headers = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" }
+          $ordered = @()
+          if ($env:WANIKHAWAR_PR_NUMBERS) { $ordered += @($env:WANIKHAWAR_PR_NUMBERS -split ',' | Where-Object { $_ }) }
+          if ($env:EXTRA_PR_NUMBERS) { $ordered += @($env:EXTRA_PR_NUMBERS -split ',' | Where-Object { $_ }) }
+          $ordered = @($ordered | Select-Object -Unique)
+          Set-Location photocraft-src
+          foreach ($number in $ordered) {
+            Write-Host "::group::Applying PR #$number"
+            $pr = Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/storytold/photocraft/pulls/$number"
+            if ($pr.state -ne "open" -and $pr.merged_at -eq $null) { throw "PR #$number is closed and not merged." }
+            Invoke-Git fetch origin "refs/pull/$number/head:refs/remotes/origin/pr-$number"
+            $commits = @(Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/storytold/photocraft/pulls/$number/commits?per_page=100")
+            if ($commits.Count -eq 0) { throw "PR #$number has no commits." }
+            if ($commits.Count -ge 100) { throw "PR #$number has 100 or more commits; pagination is required." }
+            foreach ($commit in $commits) {
+              $sha = $commit.sha
+              if ($commit.parents.Count -gt 1) { throw "PR #$number contains merge commit $sha; stopped rather than guessing." }
+              & git merge-base --is-ancestor $sha HEAD
+              if ($LASTEXITCODE -eq 0) { Write-Host "Already in history: $sha"; continue }
+              & git cherry-pick --empty=drop $sha
+              if ($LASTEXITCODE -ne 0) {
+                & git cherry-pick --abort
+                throw "Conflict applying PR #$number at $sha. Cherry-pick aborted; no build will be uploaded."
+              }
+            }
+            Write-Host "PR #$number applied."
+            Write-Host "::endgroup::"
+          }
+          "CUSTOM_BUILD_COMMIT=$(& git rev-parse HEAD)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "CUSTOM_BUILD_PRS=$($ordered -join ',')" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build PhotoCraft
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Set-Location photocraft-src
+          cargo build --release -p photocraft
+          if ($LASTEXITCODE -ne 0) { throw "PhotoCraft compilation failed." }
+          if (-not (Test-Path "target/release/photocraft.exe")) { throw "Build succeeded but target/release/photocraft.exe was not found." }
+
+      - name: Package build
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path output | Out-Null
+          Copy-Item "photocraft-src/target/release/photocraft.exe" "output/photocraft.exe"
+          @"
+          Custom PhotoCraft Windows build
+          Official base release: $env:BASE_TAG
+          Camera Raw preview: $env:CAMERA_TAG
+          Applied PRs: $env:CUSTOM_BUILD_PRS
+          Final commit: $env:CUSTOM_BUILD_COMMIT
+          Includes open PRs by wanikhawar targeting storytold/photocraft at run time if enabled.
+          This is an unofficial community build.
+          "@ | Set-Content "output/BUILD-INFO.txt" -Encoding utf8
+          Compress-Archive -Path "output/photocraft.exe", "output/BUILD-INFO.txt" -DestinationPath "photocraft-custom-windows.zip" -Force
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: photocraft-v0.14-custom-windows
+          path: |
+            output/photocraft.exe
+            output/BUILD-INFO.txt
+            photocraft-custom-windows.zip
+          if-no-files-found: error
+          retention-days: 14
