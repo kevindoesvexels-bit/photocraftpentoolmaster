@@ -1,100 +1,118 @@
 
     
   
-name: Build PhotoCraft v0.14.0 + Camera Raw + selected PRs
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "build_tag=photocraft-custom-${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+          {
+            echo "PhotoCraft custom build"
+            echo "Base release: ${{ inputs.base_release_url }}"
+            echo "Camera RAW release: ${{ inputs.camera_raw_release_url }}"
+            echo "Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo "Commit: $(git rev-parse HEAD)"
+            echo
+            echo "Applied PR URLs:"
+            cat pr-urls.txt
+          } > BUILD-INFO.txt
 
-on:
-  workflow_dispatch:
-    inputs:
-      base_release_url:
-        description: "Official PhotoCraft base release URL"
-        required: true
-        default: "https://github.com/storytold/photocraft/releases/tag/v0.14.0"
-        type: string
-      camera_raw_release_url:
-        description: "Camera Raw preview release URL"
-        required: true
-        default: "https://github.com/ametadot/photocraft/releases/tag/camera-raw-r3-preview-20261022"
-        type: string
-      include_wanikhawar_prs:
-        description: "Include all currently open PRs by wanikhawar targeting storytold/photocraft"
-        required: true
-        default: true
-        type: boolean
-      extra_pr_urls:
-        description: "Additional storytold/photocraft PR URLs, one per line, applied in this order"
-        required: true
-        default: |
-          https://github.com/storytold/photocraft/pull/8170
-          https://github.com/storytold/photocraft/pull/8679
-          https://github.com/storytold/photocraft/pull/8623
-        type: string
+      - name: Upload patched source
+        uses: actions/upload-artifact@v4
+        with:
+          name: photocraft-patched-source
+          path: |
+            .
+            !.git/**
+            !target/**
+          if-no-files-found: error
+          retention-days: 3
 
-permissions:
-  contents: read
-
-concurrency:
-  group: photocraft-custom-build-${{ github.run_id }}
-  cancel-in-progress: false
-
-jobs:
   build:
-    runs-on: windows-latest
-    timeout-minutes: 180
-
+    name: Build ${{ matrix.name }}
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: photocraft-windows-x64
+            binary: photocraft.exe
+          - name: Linux x64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: photocraft-linux-x64
+            binary: photocraft
+          - name: macOS Intel x64
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+            artifact: photocraft-macos-intel-x64
+            binary: photocraft
+          - name: macOS Apple Silicon ARM64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: photocraft-macos-apple-silicon-arm64
+            binary: photocraft
+    runs-on: ${{ matrix.os }}
     steps:
-      - name: Validate input links
-        shell: pwsh
-        env:
-          BASE_URL: ${{ inputs.base_release_url }}
-          CAMERA_URL: ${{ inputs.camera_raw_release_url }}
-          EXTRA_PR_URLS: ${{ inputs.extra_pr_urls }}
-        run: |
-          $ErrorActionPreference = "Stop"
-          function Parse-ReleaseTag([string]$Value, [string]$Owner, [string]$Repo) {
-            $uri = $null
-            if (-not [Uri]::TryCreate($Value.Trim(), [UriKind]::Absolute, [ref]$uri)) { throw "Invalid URL: $Value" }
-            if ($uri.Host -ne "github.com") { throw "Only github.com URLs are accepted: $Value" }
-            $p = $uri.AbsolutePath.Trim('/').Split('/')
-            if ($p.Length -lt 5 -or $p[0] -ne $Owner -or $p[1] -ne $Repo -or $p[2] -ne "releases" -or $p[3] -ne "tag") {
-              throw "Expected github.com/$Owner/$Repo/releases/tag/TAG"
-            }
-            return [Uri]::UnescapeDataString($p[4])
-          }
-          function Parse-PrNumber([string]$Value) {
-            $uri = $null
-            if (-not [Uri]::TryCreate($Value.Trim(), [UriKind]::Absolute, [ref]$uri)) { throw "Invalid PR URL: $Value" }
-            if ($uri.Host -ne "github.com") { throw "Only github.com PR URLs are accepted: $Value" }
-            $p = $uri.AbsolutePath.Trim('/').Split('/')
-            if ($p.Length -lt 4 -or $p[0] -ne "storytold" -or $p[1] -ne "photocraft" -or $p[2] -ne "pull" -or $p[3] -notmatch '^\d+$') {
-              throw "Expected github.com/storytold/photocraft/pull/NUMBER: $Value"
-            }
-            return $p[3]
-          }
-          $baseTag = Parse-ReleaseTag $env:BASE_URL "storytold" "photocraft"
-          $cameraTag = Parse-ReleaseTag $env:CAMERA_URL "ametadot" "photocraft"
-          $prLines = @($env:EXTRA_PR_URLS -split "[\s,;]+" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-          if ($prLines.Count -gt 30) { throw "Enter at most 30 explicit PR links." }
-          $prNumbers = @()
-          foreach ($line in $prLines) { $prNumbers += (Parse-PrNumber $line) }
-          if (($prNumbers | Select-Object -Unique).Count -ne $prNumbers.Count) { throw "Duplicate PR numbers entered." }
-          "BASE_TAG=$baseTag" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
-          "CAMERA_TAG=$cameraTag" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
-          "EXTRA_PR_NUMBERS=$($prNumbers -join ',')" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
-          Write-Host "Base: $baseTag; Camera Raw: $cameraTag; explicit PRs: $($prNumbers -join ', ')"
+      - name: Download patched source
+        uses: actions/download-artifact@v4
+        with:
+          name: photocraft-patched-source
+          path: source
 
-      - name: Check out base and apply Camera Raw commits
-        shell: pwsh
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux native dependencies
+        if: runner.os == 'Linux'
+        shell: bash
         run: |
-          $ErrorActionPreference = "Stop"
-          function Invoke-Git {
-            param([Parameter(ValueFromRemainingArguments = $true)][string[]]$GitArgs)
-            & git @GitArgs
-            if ($LASTEXITCODE -ne 0) { throw "Git failed: git $($GitArgs -join ' ')" }
-          }
-          git config --global user.name "PhotoCraft Custom Build"
-          git config --global user.email "actions@users.noreply.github.com"
-          Invoke-Git init photocraft-src
-          Set-Location photocraft-src
-          Invoke-Git remote add origin https://github.com/storytold/photocraft.git
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libssl-dev libgtk-3-dev libayatana-appindicator3-dev libwebkit2gtk-4.1-dev librsvg2-dev patchelf
+
+      - name: Install macOS native dependencies
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          brew update
+          brew install pkg-config
+          if ! brew list gtk+3 >/dev/null 2>&1; then brew install gtk+3; fi
+
+      - name: Build PhotoCraft
+        shell: bash
+        working-directory: source
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --target "${{ matrix.target }}" -p photocraft
+
+      - name: Package build
+        shell: bash
+        working-directory: source
+        env:
+          BINARY: ${{ matrix.binary }}
+          TARGET: ${{ matrix.target }}
+          ARTIFACT: ${{ matrix.artifact }}
+        run: |
+          set -euo pipefail
+          mkdir -p "package-${ARTIFACT}"
+          cp "target/${TARGET}/release/${BINARY}" "package-${ARTIFACT}/"
+          cp BUILD-INFO.txt "package-${ARTIFACT}/"
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            tar -czf "${ARTIFACT}.tar.gz" "package-${ARTIFACT}"
+          else
+            cd "package-${ARTIFACT}"
+            7z a "../${ARTIFACT}.zip" .
+          fi
+
+      - name: Upload platform artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: source/${{ matrix.artifact }}.*
+          if-no-files-found: error
+          retention-days: 14
 
